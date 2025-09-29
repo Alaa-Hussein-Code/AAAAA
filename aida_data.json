@@ -1,264 +1,61 @@
-import streamlit as st
 import pandas as pd
-from io import BytesIO
 import json
-import requests
-import time
-from typing import Dict, Any, List
+import os
 
-# --- Constants and Initialization ---
-# NOTE: The actual API key is provided at runtime by the environment.
-API_KEY = ""
-MODEL_NAME = "gemini-2.5-flash-preview-05-20"
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
-MAX_RETRIES = 5
+# --- 1. Load Classification Rules (The AIDA Dictionary) ---
+# In a real application, you would load these from a file or database.
+# We hardcode a sample here for simplicity, but we will create a JSON file 
+# in the next step which this code is designed to load.
+def load_aida_rules():
+    """Loads the AIDA keyword mapping rules."""
+    try:
+        # Load the rules from the aida_data.json file
+        with open('aida_data.json', 'r') as f:
+            rules = json.load(f)
+        return rules
+    except FileNotFoundError:
+        print("Error: aida_data.json not found. Using default internal rules.")
+        # Fallback dictionary if the file is missing
+        return {
+            "Attention": ["what is", "how to", "why is", "solve", "guide", "tutorial"],
+            "Interest": ["best", "top", "ideas", "examples", "compare", "alternative", "pros and cons"],
+            "Desire": ["review", "cost", "price", "cheap", "discount", "coupon"],
+            "Action": ["buy", "order", "purchase", "sign up", "download", "hire", "contact"]
+        }
 
-# Define default AIDA rules and structure for the prompt
-DEFAULT_RULES = {
-    "Awareness": ["what is", "how to", "information", "learn", "understand", "problem", "issue", "symptom"],
-    "Interest": ["best", "comparison", "review", "vs", "alternatives", "types of", "pros and cons"],
-    "Desire": ["deal", "discount", "cheap", "affordable", "coupon", "sale", "pricing", "cost"],
-    "Action": ["buy", "purchase", "order", "sign up", "download", "near me", "supplier", "get started"]
-}
-
-# --- AIDA Classification Logic (Simplified/Moved to app.py for API Integration) ---
-
-def classify_keyword(keyword: str, rules: Dict[str, List[str]]) -> str:
+# --- 2. Classification Function ---
+def classify_keyword(keyword, rules):
     """
-    Classifies a keyword based on simple rule-based matching.
-    This remains for comparison/fallback.
+    Classifies a single keyword into an AIDA stage.
+    It returns the first AIDA stage that matches the keyword.
     """
-    keyword_lower = keyword.lower()
-    for stage, words in rules.items():
-        if any(word in keyword_lower for word in words):
-            return stage
+    # Convert the keyword to lowercase for case-insensitive matching
+    keyword_lower = str(keyword).lower().strip()
+
+    # Check for matches in order (A > I > D > A)
+    for stage, trigger_words in rules.items():
+        for word in trigger_words:
+            if word in keyword_lower:
+                return stage
+    
+    # If no trigger word is found
     return "Unclassified"
 
-@st.cache_data(show_spinner="Analyzing keyword with AI...")
-def __aida_stage_classification(keyword: str, rules: Dict[str, List[str]]) -> str:
-    """
-    Uses the Gemini API to classify a keyword into an AIDA stage.
-    
-    We provide the rules as context to the model, but allow it to use its
-    general knowledge to classify terms that don't match the list (e.g., brand terms).
-    """
-    system_prompt = (
-        "You are an expert digital marketing analyst specializing in the AIDA funnel "
-        "(Awareness, Interest, Desire, Action). Your task is to classify a given user "
-        "search keyword into the SINGLE best AIDA stage. "
-        "Respond ONLY with the single word for the stage (Awareness, Interest, Desire, or Action). "
-        "If none of the stages fit, respond with 'Unclassified'."
-    )
+# --- 3. Process DataFrames (for Excel/CSV Upload) ---
+def process_dataframe(df, rules, keyword_column_name='Keyword'):
+    """Processes a Pandas DataFrame and adds the AIDA classification column."""
+    if keyword_column_name not in df.columns:
+        return pd.DataFrame({
+            'Error': [f"The uploaded file must contain a column named '{keyword_column_name}'."]
+        })
 
-    rule_list_str = "\n".join([f"- {stage}: {', '.join(words)}" for stage, words in rules.items()])
-
-    user_query = (
-        f"Classify the following keyword into one of the AIDA stages (Awareness, Interest, Desire, Action, or Unclassified). "
-        f"You may use the following examples as a guide, but use your best judgment for complex queries:\n"
-        f"--- AIDA Keyword Examples ---\n{rule_list_str}\n"
-        f"--- Keyword to Classify ---\n'{keyword}'"
-    )
-
-    payload = {
-        "contents": [{ "parts": [{ "text": user_query }] }],
-        "systemInstruction": { "parts": [{ "text": system_prompt }] },
-    }
-    
-    # Simple exponential backoff retry loop
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.post(API_URL, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
-            response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
-            
-            result = response.json()
-            candidate = result.get('candidates', [{}])[0]
-            stage_text = candidate.get('content', {}).get('parts', [{}])[0].get('text', 'Unclassified').strip()
-            
-            # Clean and validate the response
-            if stage_text in ["Awareness", "Interest", "Desire", "Action"]:
-                return stage_text
-            
-            return "Unclassified"
-
-        except requests.exceptions.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                # Wait before retrying (exponential backoff)
-                sleep_time = 2 ** attempt
-                time.sleep(sleep_time)
-            else:
-                st.error(f"API call failed after {MAX_RETRIES} attempts.")
-                print(f"Final API Error: {e}")
-                return "API Error"
-        except Exception as e:
-            st.error(f"An unexpected error occurred: {e}")
-            return "Error"
-    
-    return "API Error"
-
-
-def process_dataframe(df: pd.DataFrame, rules: Dict[str, List[str]], column_name: str) -> pd.DataFrame:
-    """Processes DataFrame for bulk classification using the rule-based approach."""
-    # Ensure all keywords are strings and fill missing values
-    df[column_name] = df[column_name].astype(str).fillna('')
-    
-    # Apply the rule-based classification function
-    df['AIDA Stage (Rule-Based)'] = df[column_name].apply(lambda x: classify_keyword(x, rules))
-    
-    return df
-
-def process_dataframe_ai(df: pd.DataFrame, rules: Dict[str, List[str]], column_name: str) -> pd.DataFrame:
-    """Processes DataFrame for bulk classification using the AI approach."""
-    # Ensure all keywords are strings and fill missing values
-    df[column_name] = df[column_name].astype(str).fillna('')
-    
-    # Apply the AI classification function
-    df['AIDA Stage (AI-Powered)'] = df[column_name].apply(lambda x: __aida_stage_classification(x, rules))
-    
-    return df
-
-# --- Helper function for download button ---
-@st.cache_data
-def convert_df_to_excel(df):
-    """Converts a DataFrame to an Excel file buffer for download."""
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='AIDA_Classification')
-    processed_data = output.getvalue()
-    return processed_data
-
-# --- Configuration and Initialization ---
-st.set_page_config(layout="wide", page_title="AIDA Keyword Classifier")
-RULES = DEFAULT_RULES # Use the local default rules
-
-# --- Main App Title and Description ---
-st.title("🚀 AI-Powered AIDA Keyword Classification Tool")
-st.markdown("Use this tool to categorize your marketing keywords into the Awareness, Interest, Desire, or Action stages of the AIDA funnel. Choose between fast **Rule-Based** matching or intelligent **AI-Powered** classification.")
-
-# --- Sidebar for Rules Display and Customization ---
-st.sidebar.header("Classification Rules (Rule-Based)")
-st.sidebar.markdown(
-    """
-    The **Rule-Based** classifier checks for these specific words. 
-    The **AI-Powered** classifier uses these as hints but relies on general AI knowledge.
-    """
-)
-# Display the loaded rules
-for stage, words in RULES.items():
-    st.sidebar.subheader(f"✨ {stage}")
-    st.sidebar.text(", ".join(words))
-
-
-# --- Tabs for Input Methods ---
-tab_manual, tab_bulk = st.tabs(["✍️ Single Keyword Entry", "📁 Bulk File Upload (Excel/CSV)"])
-
-
-# 1. MANUAL ENTRY TAB
-with tab_manual:
-    st.header("Single Keyword Analysis")
-    
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        user_keyword = st.text_input(
-            "Enter your keyword or phrase here:",
-            placeholder="e.g., why is my roof leaking in winter"
-        )
-    
-    with col2:
-        classification_method = st.radio(
-            "Select Classification Method:",
-            ["AI-Powered", "Rule-Based"],
-            index=0,
-            help="AI-Powered uses the Gemini API for smart classification. Rule-Based uses only the sidebar keyword list."
-        )
-
-    if st.button("Classify Keyword", type="primary") and user_keyword:
-        if classification_method == "Rule-Based":
-            stage = classify_keyword(user_keyword, RULES)
-            method_note = "Rule-Based"
-        else:
-            stage = __aida_stage_classification(user_keyword, RULES)
-            method_note = "AI-Powered"
-
-        # Display the result with styling
-        if stage in ["Unclassified", "API Error", "Error"]:
-            st.warning(f"Keyword: **'{user_keyword}'** was **{stage}** via **{method_note}** classification.", icon="⚠️")
-        else:
-            st.success(f"Keyword: **'{user_keyword}'** is in the **{stage}** stage via **{method_note}** classification.", icon="✅")
-        
-        if method_note == "Rule-Based":
-            st.info("The Rule-Based classification is based on simple keyword matching. If the result is incorrect, adjust the rules shown in the sidebar.")
-        else:
-             st.info("The AI-Powered classification uses Gemini's advanced understanding of marketing intent. Results are generally superior to rule-based methods.")
-
-
-# 2. BULK UPLOAD TAB
-with tab_bulk:
-    st.header("Bulk Keyword Analysis")
-    
-    uploaded_file = st.file_uploader(
-        "Upload an Excel (.xlsx) or CSV file.", 
-        type=["xlsx", "csv"],
-        help="The file must contain a column named 'Keyword'."
+    # Apply the classification function to every keyword in the specified column
+    df['AIDA Stage'] = df[keyword_column_name].apply(
+        lambda x: classify_keyword(x, rules)
     )
     
-    col_name_input, method_select = st.columns(2)
+    # Reorder columns to show the classification first
+    cols = ['AIDA Stage', keyword_column_name] + [col for col in df.columns if col not in ['AIDA Stage', keyword_column_name]]
+    return df[cols]
 
-    with col_name_input:
-        # Input field for the column name, useful if it's not 'Keyword'
-        keyword_col_name = st.text_input(
-            "Enter the exact name of the keyword column in your file:",
-            value="Keyword"
-        )
-        
-    with method_select:
-        bulk_classification_method = st.radio(
-            "Select Bulk Classification Method:",
-            ["AI-Powered", "Rule-Based"],
-            index=1, # Default to Rule-Based for speed on large files
-            help="AI-Powered uses the Gemini API, which is slower but more accurate. Rule-Based is extremely fast but relies only on the sidebar keyword list."
-        )
-
-    if uploaded_file is not None:
-        try:
-            # Read the file based on type
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            else: # Must be Excel (.xlsx)
-                # This requires the 'openpyxl' dependency which was missing.
-                df = pd.read_excel(uploaded_file, engine='openpyxl')
-            
-            # Show a preview of the original data
-            st.subheader("Original Data Preview")
-            st.dataframe(df.head())
-
-            # Check if the required column exists before processing
-            if keyword_col_name not in df.columns:
-                st.error(f"Error: The uploaded file does not contain a column named **'{keyword_col_name}'**.")
-            else:
-                if bulk_classification_method == "Rule-Based":
-                     # Process the DataFrame using the rule-based approach
-                    processed_df = process_dataframe(df, RULES, keyword_col_name)
-                    st.success("Rule-Based classification complete.")
-                else:
-                    # Process the DataFrame using the AI approach
-                    processed_df = process_dataframe_ai(df, RULES, keyword_col_name)
-                    st.success("AI-Powered classification complete.")
-
-                st.subheader("Classification Results")
-                st.dataframe(processed_df, use_container_width=True)
-
-                # Generate Download Button
-                st.download_button(
-                    label="⬇️ Download Classified Excel File",
-                    data=convert_df_to_excel(processed_df),
-                    file_name="AIDA_Classified_Keywords.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
-
-        except ImportError:
-            st.error("Missing dependency! Please run `pip install openpyxl` in your terminal to enable Excel file uploads.")
-        except Exception as e:
-            st.error(f"An error occurred during file processing. Please ensure the file format is correct and the column name is accurate.")
-            st.exception(e)
+# We will now create the aida_data.json file to accompany this script.
